@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -22,25 +23,21 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
 
+_ZERO_WIDTH_CHARS = "\u200b\u200c\u200d\ufeff\u2060\u00ad"
 
-# ============================================================
-# Implement detect_injection()
-#
-# Canonicalize Unicode/invisible spacing, then detect prompt injection.
-# Return ``"BLOCK"`` if injection is detected, else ``"ALLOW"``.
-#
-# Required cases:
-# - "ignore (all )?(previous|above) instructions"
-# - "you are now"
-# - "system prompt"
-# - "reveal your (instructions|prompt)"
-# - "pretend you are"
-# - "act as (a |an )?unrestricted"
-# Also handle an instruction embedded in an untrusted email/RAG document, e.g.
-# ``Ignore\u200b all previous instructions``. Do not block a benign request to
-# summarize an external bank-transfer email just because it is external data.
-# Regex is one signal, not the whole security boundary.
-# ============================================================
+
+def _canonicalize_text(text: str) -> str:
+    """Normalize Unicode (NFKC), strip invisible characters, and collapse spaces."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    cleaned = normalized.translate(str.maketrans("", "", _ZERO_WIDTH_CHARS))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _fold_accents(text: str) -> str:
+    """ASCII-fold Vietnamese diacritics so topic keywords match accented & unaccented text."""
+    decomposed = unicodedata.normalize("NFD", text.replace("đ", "d").replace("Đ", "D"))
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+
 
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
@@ -51,28 +48,30 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
+    canonical = _canonicalize_text(user_input)
+    if not canonical:
+        return "ALLOW"
+
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore\s+(?:all\s+)?(?:previous|above|prior)?\s*instructions?",
+        r"disregard\s+(?:all\s+)?(?:previous|above|prior)?\s*(?:instructions?|rules?|directives?)",
+        r"forget\s+(?:all\s+|your\s+)?(?:previous\s+)?(?:instructions?|rules?|prompt)",
+        r"override\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions?|rules?)",
+        r"you\s+are\s+now\b",
+        r"\bsystem\s+prompt\b",
+        r"reveal\s+(?:your\s+)?(?:system\s+)?(?:instructions?|prompt|secrets?|password|api\s*key)",
+        r"pretend\s+(?:you\s+are|to\s+be)",
+        r"act\s+as\s+(?:a\s+|an\s+)?unrestricted",
+        r"\b(?:DAN|do anything now)\b",
+        r"bỏ\s+qua\s+(?:mọi\s+|tất\s+cả\s+)?(?:hướng\s+dẫn|chỉ\s+dẫn|quy\s+tắc)",
+        r"(?:tiết\s+lộ|cho\s+xem|in\s+ra)\s+(?:system\s*prompt|mật\s+khẩu|api\s*key|hướng\s+dẫn)",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, canonical, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
-
-# ============================================================
-# Implement topic_filter()
-#
-# Check if user_input belongs to allowed topics.
-# The VinBank agent should only answer about: banking, account,
-# transaction, loan, interest rate, savings, credit card.
-#
-# Return ``"BLOCK"`` if input should be blocked (off-topic / blocked topic).
-# Return ``"ALLOW"`` if banking-related and OK.
-# ============================================================
 
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
@@ -84,14 +83,22 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    canonical = _canonicalize_text(user_input)
+    if not canonical:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    input_lower = canonical.lower()
+    folded_lower = _fold_accents(input_lower)
 
-    pass  # Replace with your implementation
+    for blocked in BLOCKED_TOPICS:
+        if re.search(rf"\b{re.escape(blocked.lower())}", folded_lower):
+            return "BLOCK"
+
+    for allowed in ALLOWED_TOPICS:
+        if allowed.lower() in input_lower or allowed.lower() in folded_lower:
+            return "ALLOW"
+
+    return "BLOCK"
 
 
 # ============================================================
@@ -144,14 +151,19 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot process that request. I only help with VinBank banking questions."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related questions."
+            )
+
+        return None
 
 
 # ============================================================
